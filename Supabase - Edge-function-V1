@@ -1,0 +1,168 @@
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2"
+
+serve(async (req) => {
+  // ⛔ Allow only POST
+  if (req.method !== "POST") {
+    return new Response("Method Not Allowed", { status: 405 })
+  }
+
+  // 📦 Parse JSON
+  let payload
+  try {
+    payload = await req.json()
+  } catch {
+    return new Response(
+      JSON.stringify({ error: "Invalid JSON body" }),
+      { status: 400 }
+    )
+  }
+
+  // 🔐 Secret check
+  const expectedSecret = Deno.env.get("TV_WEBHOOK_SECRET")
+
+  if (!expectedSecret) {
+    return new Response(
+      JSON.stringify({ error: "Server misconfigured" }),
+      { status: 500 }
+    )
+  }
+
+  if (payload.secret !== expectedSecret) {
+    return new Response(
+      JSON.stringify({ error: "Unauthorized" }),
+      { status: 401 }
+    )
+  }
+
+  // 🔑 Supabase client (SERVICE ROLE)
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+  )
+
+  // 🧠 Event routing
+  const event = payload.event ?? "OPEN"
+
+  // 🧪 Basic validation
+  if (!payload.trade_id) {
+    return new Response(
+      JSON.stringify({ error: "Missing trade_id" }),
+      { status: 400 }
+    )
+  }
+
+  // ======================
+  // 🚀 EVENT HANDLING
+  // ======================
+
+  // 🔓 OPEN TRADE
+  if (event === "OPEN") {
+    if (
+      !payload.symbol ||
+      !payload.market ||
+      !payload.side ||
+      payload.entry === undefined ||
+      payload.sl === undefined
+    ) {
+      return new Response(
+        JSON.stringify({ error: "Invalid OPEN payload" }),
+        { status: 400 }
+      )
+    }
+
+    const { error } = await supabase
+      .from("signals")
+      .insert({
+        trade_id: payload.trade_id,
+        symbol: payload.symbol,
+        market: payload.market,
+        side: payload.side,
+        entry: Number(payload.entry),
+        tp1: payload.tp1 ? Number(payload.tp1) : null,
+        tp2: payload.tp2 ? Number(payload.tp2) : null,
+        sl: Number(payload.sl),
+        timeframe: payload.timeframe ?? null,
+        status: "active",
+        tp1_hit: false,
+        tp2_hit: false,
+        sl_hit: false,
+        source: "tradingview"
+      })
+
+    if (error) {
+      return new Response(
+        JSON.stringify({ error: error.message }),
+        { status: 500 }
+      )
+    }
+  }
+
+  // 🎯 TP1 HIT
+  else if (event === "TP1") {
+    const { error } = await supabase
+      .from("signals")
+      .update({ tp1_hit: true })
+      .eq("trade_id", payload.trade_id)
+      .eq("tp1_hit", false)
+
+    if (error) {
+      return new Response(
+        JSON.stringify({ error: error.message }),
+        { status: 500 }
+      )
+    }
+  }
+
+  // 🏁 TP2 HIT → CLOSE
+  else if (event === "TP2") {
+    const { error } = await supabase
+      .from("signals")
+      .update({
+        tp2_hit: true,
+        status: "closed"
+      })
+      .eq("trade_id", payload.trade_id)
+      .eq("tp2_hit", false)
+
+    if (error) {
+      return new Response(
+        JSON.stringify({ error: error.message }),
+        { status: 500 }
+      )
+    }
+  }
+
+  // ❌ STOP LOSS HIT → CLOSE
+  else if (event === "SL") {
+    const { error } = await supabase
+      .from("signals")
+      .update({
+        sl_hit: true,
+        status: "closed"
+      })
+      .eq("trade_id", payload.trade_id)
+      .eq("sl_hit", false)
+
+    if (error) {
+      return new Response(
+        JSON.stringify({ error: error.message }),
+        { status: 500 }
+      )
+    }
+  }
+
+  // ❓ UNKNOWN EVENT
+  else {
+    return new Response(
+      JSON.stringify({ error: "Unknown event type" }),
+      { status: 400 }
+    )
+  }
+
+  // ✅ SUCCESS
+  return new Response(
+    JSON.stringify({ success: true, event }),
+    { status: 200 }
+  )
+})
