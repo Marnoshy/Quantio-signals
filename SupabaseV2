@@ -1,0 +1,233 @@
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2"
+
+/* ======================
+   HELPERS
+====================== */
+
+function normalizeTimeframe(tf?: string): string | null {
+  if (!tf) return null
+  switch (tf) {
+    case "30S": return "30S"
+    case "1": return "M1"
+    case "5": return "M5"
+    case "15": return "M15"
+    case "30": return "M30"
+    case "60": return "H1"
+    case "240": return "H4"
+    case "D":
+    case "D1": return "D1"
+    default: return tf
+  }
+}
+
+function getTradingStyle(tf?: string): string | null {
+  if (!tf) return null
+  if (tf === "30S" || tf === "M1") return "scalping"
+  if (tf === "M5" || tf === "M15" || tf === "M30") return "day_trading"
+  if (tf === "H1" || tf === "H4" || tf === "D1") return "swing_trading"
+  return null
+}
+
+function mapTimeframeToChartImg(tf?: string): string {
+  switch (tf) {
+    case "30S":
+    case "1":
+    case "M1": return "1m"
+    case "5":
+    case "M5": return "5m"
+    case "15":
+    case "M15": return "15m"
+    case "30":
+    case "M30": return "30m"
+    case "60":
+    case "H1": return "1h"
+    case "240":
+    case "H4": return "4h"
+    case "D":
+    case "D1": return "1D"
+    default: return "1m"
+  }
+}
+
+function buildTvSymbol(market: string, symbol: string): string | null {
+  if (!market || !symbol) return null
+
+  switch (market) {
+    case "Forex":
+      return `TICKMILL:${symbol}`
+
+    case "Crypto":
+      return `COINBASE:${symbol}`
+
+    case "Indices":
+      return `TVC:${symbol}`
+
+    case "Metals":
+      return `ICMARKETS:${symbol}`
+
+    case "Stocks":
+      return `NASDAQ:${symbol}`
+
+    default:
+      console.warn("[TV SYMBOL] Unsupported market:", market)
+      return null
+  }
+}
+
+
+/* ======================
+   CHART IMG
+====================== */
+
+async function captureChartImage(tvSymbol: string, interval: string): Promise<Uint8Array> {
+  console.log("[CHART] Request", { tvSymbol, interval })
+
+  const res = await fetch(
+    `https://api.chart-img.com/v2/tradingview/layout-chart/${Deno.env.get("CHART_IMG_LAYOUT_ID")}`,
+    {
+      method: "POST",
+      headers: {
+        "x-api-key": Deno.env.get("CHART_IMG_API_KEY")!,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        symbol: tvSymbol,
+        interval,
+        width: 1920,
+        height: 1000,
+        format: "png",
+        resetZoom: true,
+      }),
+    }
+  )
+
+  if (!res.ok) {
+    const err = await res.text()
+    console.error("[CHART] ERROR", err)
+    throw new Error(err)
+  }
+
+  return new Uint8Array(await res.arrayBuffer())
+}
+
+async function uploadChart(
+  supabase: any,
+  buffer: Uint8Array,
+  tradeId: string,
+  stage: "open" | "closed"
+): Promise<string> {
+  const path = `${stage}/${tradeId}.png`
+
+  const { error } = await supabase.storage
+    .from("signals-charts")
+    .upload(path, buffer, { contentType: "image/png", upsert: true })
+
+  if (error) throw error
+
+  return `${Deno.env.get("SUPABASE_URL")}/storage/v1/object/public/signals-charts/${path}`
+}
+
+/* ======================
+   SERVER
+====================== */
+
+serve(async (req) => {
+  console.log("========== NEW REQUEST ==========")
+
+  if (req.method !== "POST")
+    return new Response("Method Not Allowed", { status: 405 })
+
+  const payload = await req.json()
+  console.log("[PAYLOAD]", payload)
+
+  if (payload.secret !== Deno.env.get("TV_WEBHOOK_SECRET"))
+    return new Response("Unauthorized", { status: 401 })
+
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+  )
+
+  const event = payload.event ?? "OPEN"
+  console.log("[EVENT]", event)
+
+  /* ======================
+     OPEN
+  ====================== */
+  if (event === "OPEN") {
+    const tvSymbol = buildTvSymbol(payload.market, payload.symbol)
+    const normalizedTf = normalizeTimeframe(payload.timeframe)
+    const chartInterval = mapTimeframeToChartImg(payload.timeframe)
+
+    await supabase.from("signals").insert({
+      trade_id: payload.trade_id,
+      symbol: payload.symbol,
+      market: payload.market,
+      tv_symbol: tvSymbol,
+      side: payload.side,
+      entry: payload.entry,
+      tp: payload.tp ?? payload.tp2,
+      sl: payload.sl,
+      timeframe: normalizedTf,
+      trading_style: getTradingStyle(normalizedTf ?? undefined),
+      status: "active",
+      tp_hit: false,
+      sl_hit: false,
+      source: "tradingview",
+    })
+
+    // 🔒 GUARD OPEN SCREENSHOT
+    const { data } = await supabase
+      .from("signals")
+      .select("chart_open_url")
+      .eq("trade_id", payload.trade_id)
+      .single()
+
+    if (!data?.chart_open_url) {
+      try {
+        const img = await captureChartImage(tvSymbol!, chartInterval)
+        const url = await uploadChart(supabase, img, payload.trade_id, "open")
+        await supabase.from("signals").update({ chart_open_url: url }).eq("trade_id", payload.trade_id)
+        console.log("[OPEN] Screenshot OK")
+      } catch (e) {
+        console.error("[OPEN] Screenshot FAILED", e)
+      }
+    } else {
+      console.log("[OPEN] Screenshot skipped (already exists)")
+    }
+  }
+
+  /* ======================
+     CLOSE
+  ====================== */
+  if (event === "TP2" || event === "SL") {
+    await supabase.from("signals").update({
+      status: "closed",
+      tp_hit: event === "TP2",
+      sl_hit: event === "SL",
+    }).eq("trade_id", payload.trade_id)
+
+    const { data } = await supabase
+      .from("signals")
+      .select("tv_symbol, timeframe, chart_close_url")
+      .eq("trade_id", payload.trade_id)
+      .single()
+
+    if (data && !data.chart_close_url) {
+      const chartInterval = mapTimeframeToChartImg(data.timeframe)
+      try {
+        const img = await captureChartImage(data.tv_symbol, chartInterval)
+        const url = await uploadChart(supabase, img, payload.trade_id, "closed")
+        await supabase.from("signals").update({ chart_close_url: url }).eq("trade_id", payload.trade_id)
+        console.log("[CLOSE] Screenshot OK")
+      } catch (e) {
+        console.error("[CLOSE] Screenshot FAILED", e)
+      }
+    } else {
+      console.log("[CLOSE] Screenshot skipped (already exists or trade missing)")
+    }
+  }
+
+  return new Response(JSON.stringify({ success: true }), { status: 200 })
+})
