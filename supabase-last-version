@@ -1,0 +1,571 @@
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2"
+
+/* ======================
+   CHART-IMG QUEUE SYSTEM
+   Prevents rate limiting when multiple signals arrive simultaneously
+====================== */
+
+// Simple in-memory queue for chart captures
+const chartQueue: Array<{
+  resolve: (value: Uint8Array) => void
+  reject: (error: Error) => void
+  tvSymbol: string
+  interval: string
+}> = []
+
+let isProcessingQueue = false
+const DELAY_BETWEEN_REQUESTS_MS = 2000 // 2 seconds between each chart-img request
+const MAX_RETRIES = 3
+const RETRY_DELAY_MS = 3000
+
+async function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function processChartQueue(): Promise<void> {
+  if (isProcessingQueue) return
+  isProcessingQueue = true
+
+  while (chartQueue.length > 0) {
+    const task = chartQueue.shift()
+    if (!task) continue
+
+    try {
+      const result = await captureChartImageWithRetry(task.tvSymbol, task.interval)
+      task.resolve(result)
+    } catch (error) {
+      task.reject(error as Error)
+    }
+
+    // Wait before processing next request to avoid rate limiting
+    if (chartQueue.length > 0) {
+      await sleep(DELAY_BETWEEN_REQUESTS_MS)
+    }
+  }
+
+  isProcessingQueue = false
+}
+
+async function captureChartImageWithRetry(
+  tvSymbol: string,
+  interval: string,
+  attempt: number = 1
+): Promise<Uint8Array> {
+  console.log(`[CHART] Attempt ${attempt}/${MAX_RETRIES}`, { tvSymbol, interval })
+
+  try {
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 60000) // 60 second timeout as per docs
+
+    const res = await fetch(
+      `https://api.chart-img.com/v2/tradingview/layout-chart/${Deno.env.get("CHART_IMG_LAYOUT_ID")}`,
+      {
+        method: "POST",
+        headers: {
+          "x-api-key": Deno.env.get("CHART_IMG_API_KEY")!,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          symbol: tvSymbol,
+          interval,
+          width: 1920,
+          height: 1000,
+          format: "png",
+          resetZoom: true,
+        }),
+        signal: controller.signal,
+      }
+    )
+
+    clearTimeout(timeoutId)
+
+    if (!res.ok) {
+      const err = await res.text()
+      console.error(`[CHART] HTTP Error ${res.status}:`, err)
+
+      // Check if it's a rate limit error (usually 429)
+      if (res.status === 429 && attempt < MAX_RETRIES) {
+        console.log(`[CHART] Rate limited, waiting ${RETRY_DELAY_MS * attempt}ms before retry...`)
+        await sleep(RETRY_DELAY_MS * attempt)
+        return captureChartImageWithRetry(tvSymbol, interval, attempt + 1)
+      }
+
+      // Retry on server errors (5xx)
+      if (res.status >= 500 && attempt < MAX_RETRIES) {
+        console.log(`[CHART] Server error, waiting ${RETRY_DELAY_MS}ms before retry...`)
+        await sleep(RETRY_DELAY_MS)
+        return captureChartImageWithRetry(tvSymbol, interval, attempt + 1)
+      }
+
+      throw new Error(`Chart API error ${res.status}: ${err}`)
+    }
+
+    console.log(`[CHART] Success on attempt ${attempt}`)
+    return new Uint8Array(await res.arrayBuffer())
+
+  } catch (error) {
+    if ((error as Error).name === "AbortError") {
+      console.error("[CHART] Request timed out")
+      if (attempt < MAX_RETRIES) {
+        console.log(`[CHART] Timeout, retrying...`)
+        await sleep(RETRY_DELAY_MS)
+        return captureChartImageWithRetry(tvSymbol, interval, attempt + 1)
+      }
+    }
+    throw error
+  }
+}
+
+// Queue-based chart capture - adds to queue and returns promise
+function queueChartCapture(tvSymbol: string, interval: string): Promise<Uint8Array> {
+  return new Promise((resolve, reject) => {
+    chartQueue.push({ resolve, reject, tvSymbol, interval })
+    console.log(`[CHART QUEUE] Added task, queue size: ${chartQueue.length}`)
+    processChartQueue() // Start processing if not already running
+  })
+}
+
+/* ======================
+   HELPERS
+====================== */
+
+function normalizeTimeframe(tf?: string): string | null {
+  if (!tf) return null
+
+  switch (tf) {
+    case "30S": return "30S"
+    case "1": return "M1"
+    case "3": return "M3"
+    case "5": return "M5"
+    case "15": return "M15"
+    case "30": return "M30"
+    case "45": return "M45"
+    case "60": return "H1"
+    case "120": return "H2"
+    case "240": return "H4"
+    case "D":
+    case "D1": return "D1"
+    default: return tf
+  }
+}
+
+
+function getTradingStyle(tf?: string): string | null {
+  if (!tf) return null
+
+  // Scalping
+  if (tf === "M1" || tf === "M3" || tf === "M5" || tf === "30S")
+    return "Scalping"
+
+  // Day trading
+  if (tf === "M15" || tf === "M30" || tf === "M45")
+    return "Day"
+
+  // Swing (everything else)
+  return "Swing"
+}
+
+
+function mapTimeframeToChartImg(tf?: string): string {
+  switch (tf) {
+    case "30S": return "30s"
+    case "1":
+    case "M1": return "1m"
+    case "3":
+    case "M3": return "3m"
+    case "5":
+    case "M5": return "5m"
+    case "15":
+    case "M15": return "15m"
+    case "30":
+    case "M30": return "30m"
+    case "45":
+    case "M45": return "45m"
+    case "60":
+    case "H1": return "1h"
+    case "120":
+    case "H2": return "2h"
+    case "240":
+    case "H4": return "4h"
+    case "D":
+    case "D1": return "1D"
+    default: return "1m"
+  }
+}
+
+
+function buildTvSymbol(market: string, symbol: string): string | null {
+  if (!market || !symbol) return null
+
+  switch (market) {
+    case "Forex":
+      return `TICKMILL:${symbol}`
+
+    case "Crypto":
+      return `COINBASE:${symbol}`
+
+    case "Indices":
+      return `TVC:${symbol}`
+
+    case "Metals":
+      return `ICMARKETS:${symbol}`
+
+    case "Stocks":
+      return `NASDAQ:${symbol}`
+
+    default:
+      console.warn("[TV SYMBOL] Unsupported market:", market)
+      return null
+  }
+}
+
+/* ======================
+   DISCORD ALERTS
+====================== */
+function getDiscordWebhook(market: string, style: string): string | null {
+  const m = (market || "").toUpperCase()
+  const s = (style || "").toUpperCase()
+
+  const key = `DISCORD_WEBHOOK_${m}_${s}`
+  const url = Deno.env.get(key) ?? null
+
+  console.log("[DISCORD] Webhook lookup", { market, style, key, found: Boolean(url) })
+
+  if (!url || url.trim().length < 20) return null
+  return url
+}
+
+function getDiscordCloseWebhook(market?: string): string | null {
+  if (!market) {
+    console.error("[DISCORD] CLOSE market is missing")
+    return null
+  }
+
+  const m = market.toUpperCase().trim()
+  const key = `DISCORD_WEBHOOK_${m}_CLOSED`
+  const url = Deno.env.get(key)
+
+  console.log("[DISCORD] CLOSE webhook lookup", {
+    market,
+    normalized: m,
+    key,
+    found: Boolean(url),
+  })
+
+  if (!url || url.trim().length < 20) return null
+  return url
+}
+
+
+async function sendToDiscord(webhookUrl: string, payload: any) {
+  const res = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  })
+
+  if (!res.ok) {
+    const err = await res.text()
+    throw new Error(err)
+  }
+}
+
+
+function formatCloseEmbed(params: {
+  symbol: string
+  market: string
+  side: "buy" | "sell"
+  entry: number
+  tp: number
+  sl: number
+  result: "TP" | "SL"
+  timeframe: string
+  chartUrl?: string
+}) {
+  const isWin = params.result === "TP"
+
+  const emoji = isWin ? "✅" : "❌"
+  const color = isWin ? 0x2ecc71 : 0xe74c3c
+  const rReturn = isWin ? "+2R" : "-1R"
+
+  return {
+    embeds: [
+      {
+        title: `${emoji} TRADE CLOSED — ${params.symbol} (${params.timeframe})`,
+        color,
+        fields: [
+          { name: "Side", value: params.side.toUpperCase(), inline: true },
+          { name: "Result", value: isWin ? "TP HIT" : "STOP LOSS", inline: true },
+          { name: "Return", value: `**${rReturn}**`, inline: true },
+
+          { name: "Entry", value: String(params.entry), inline: true },
+          { name: "SL", value: String(params.sl), inline: true },
+          { name: "TP", value: String(params.tp), inline: true },
+        ],
+        image: params.chartUrl ? { url: params.chartUrl } : undefined,
+        footer: {
+          text: "Quantio • Verified Trade Result",
+        },
+        timestamp: new Date().toISOString(),
+      },
+    ],
+  }
+}
+
+
+/* ======================
+   UPLOAD CHART
+====================== */
+
+async function uploadChart(
+  supabase: any,
+  buffer: Uint8Array,
+  tradeId: string,
+  stage: "open" | "closed"
+): Promise<string> {
+  const path = `${stage}/${tradeId}.png`
+
+  const { error } = await supabase.storage
+    .from("signals-charts")
+    .upload(path, buffer, { contentType: "image/png", upsert: true })
+
+  if (error) throw error
+
+  return `${Deno.env.get("SUPABASE_URL")}/storage/v1/object/public/signals-charts/${path}`
+}
+
+/* ======================
+   BACKGROUND SCREENSHOT HANDLER
+   Process screenshots asynchronously to not block webhook response
+====================== */
+
+async function handleScreenshot(
+  supabase: any,
+  tradeId: string,
+  tvSymbol: string,
+  chartInterval: string,
+  stage: "open" | "closed"
+): Promise<string | null> {
+  try {
+    console.log(`[SCREENSHOT] Starting ${stage} capture for ${tradeId}`)
+    
+    // Use queued capture instead of direct call
+    const img = await queueChartCapture(tvSymbol, chartInterval)
+    const url = await uploadChart(supabase, img, tradeId, stage)
+    
+    // Update database with chart URL
+    const updateField = stage === "open" ? "chart_open_url" : "chart_close_url"
+    await supabase
+      .from("signals")
+      .update({ [updateField]: url })
+      .eq("trade_id", tradeId)
+    
+    console.log(`[SCREENSHOT] ${stage} capture SUCCESS for ${tradeId}`)
+    return url
+  } catch (e) {
+    console.error(`[SCREENSHOT] ${stage} capture FAILED for ${tradeId}:`, e)
+    return null
+  }
+}
+
+/* ======================
+   SERVER
+====================== */
+
+serve(async (req) => {
+  console.log("========== NEW REQUEST ==========")
+
+  if (req.method !== "POST")
+    return new Response("Method Not Allowed", { status: 405 })
+
+  const payload = await req.json()
+  console.log("[PAYLOAD]", payload)
+
+  if (payload.secret !== Deno.env.get("TV_WEBHOOK_SECRET"))
+    return new Response("Unauthorized", { status: 401 })
+
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+  )
+
+  const event = payload.event ?? "OPEN"
+  console.log("[EVENT]", event)
+
+  /* ======================
+     OPEN
+  ====================== */
+  if (event === "OPEN") {
+    const tvSymbol = buildTvSymbol(payload.market, payload.symbol)
+    const normalizedTf = normalizeTimeframe(payload.timeframe)
+    const chartInterval = mapTimeframeToChartImg(payload.timeframe)
+    const tradingStyle = getTradingStyle(normalizedTf ?? undefined)
+
+    // Insert signal first
+    const { error: insertError } = await supabase.from("signals").insert({
+      trade_id: payload.trade_id,
+      symbol: payload.symbol,
+      market: payload.market,
+      tv_symbol: tvSymbol,
+      side: payload.side,
+      entry: payload.entry,
+      tp: payload.tp ?? payload.tp2,
+      sl: payload.sl,
+      timeframe: normalizedTf,
+      trading_style: tradingStyle,
+      status: "active",
+      tp_hit: false,
+      sl_hit: false,
+      source: "tradingview",
+    })
+
+    if (insertError) {
+      console.error("[DB] Insert error:", insertError)
+      return new Response(JSON.stringify({ error: "DB insert failed" }), { status: 500 })
+    }
+
+    // Check if screenshot already exists
+    const { data: existingData } = await supabase
+      .from("signals")
+      .select("chart_open_url")
+      .eq("trade_id", payload.trade_id)
+      .single()
+
+    let chartUrl = existingData?.chart_open_url
+
+    // Take screenshot using queue system
+    if (!chartUrl && tvSymbol) {
+      chartUrl = await handleScreenshot(
+        supabase,
+        payload.trade_id,
+        tvSymbol,
+        chartInterval,
+        "open"
+      )
+    }
+
+    // Send Discord notification
+    const webhook = getDiscordWebhook(payload.market, tradingStyle!)
+
+    if (webhook) {
+      try {
+        const embed: any = {
+          title: `${payload.side.toUpperCase()} | ${payload.market} | ${payload.symbol} | ${normalizedTf}`,
+          color: payload.side === "buy" ? 0x2ecc71 : 0xe74c3c,
+          fields: [
+            { name: "Entry", value: String(payload.entry), inline: true },
+            { name: "SL", value: String(payload.sl), inline: true },
+            { name: "TP", value: String(payload.tp ?? payload.tp2), inline: true },
+            { name: "Style", value: tradingStyle ?? "N/A", inline: true },
+          ],
+          footer: {
+            text: "Quantio • Verified Trading Signal",
+          },
+          timestamp: new Date().toISOString(),
+        }
+
+        // Add chart image if available
+        if (chartUrl) {
+          embed.image = { url: chartUrl }
+        }
+
+        await sendToDiscord(webhook, {
+          username: "Quantio Signal Bot",
+          embeds: [embed],
+        })
+
+        console.log("[DISCORD] OPEN signal sent")
+      } catch (e) {
+        console.error("[DISCORD] OPEN failed", e)
+      }
+    } else {
+      console.warn("[DISCORD] No webhook configured for this market/style")
+    }
+  }
+
+  /* ======================
+     CLOSE (TP2 or SL)
+  ====================== */
+  if (event === "TP2" || event === "SL") {
+    const result = event === "TP2" ? "TP" : "SL"
+
+    // Update signal status
+    await supabase.from("signals").update({
+      status: "closed",
+      tp_hit: event === "TP2",
+      sl_hit: event === "SL",
+      closed_at: new Date().toISOString(),
+    }).eq("trade_id", payload.trade_id)
+
+    // Get signal data
+    const { data } = await supabase
+      .from("signals")
+      .select("tv_symbol, timeframe, chart_close_url, entry, tp, sl, side, market, symbol")
+      .eq("trade_id", payload.trade_id)
+      .single()
+
+    if (!data) {
+      console.error("[CLOSE] Signal not found:", payload.trade_id)
+      return new Response(JSON.stringify({ error: "Signal not found" }), { status: 404 })
+    }
+
+    console.log("[CLOSE] DB DATA", {
+      trade_id: payload.trade_id,
+      market: data.market,
+      symbol: data.symbol,
+      timeframe: data.timeframe,
+    })
+
+    let chartUrl = data.chart_close_url
+
+    // Take close screenshot using queue system
+    if (!chartUrl && data.tv_symbol) {
+      const chartInterval = mapTimeframeToChartImg(data.timeframe)
+      chartUrl = await handleScreenshot(
+        supabase,
+        payload.trade_id,
+        data.tv_symbol,
+        chartInterval,
+        "closed"
+      )
+    }
+
+    // Send Discord CLOSE notification
+    if (!data.market) {
+      console.error("[CLOSE] Missing market in DB for trade", payload.trade_id)
+      return new Response(JSON.stringify({ error: "Market missing" }), { status: 500 })
+    }
+
+    const closeWebhook = getDiscordCloseWebhook(data.market)
+
+    if (closeWebhook) {
+      try {
+        const embedPayload = formatCloseEmbed({
+          symbol: data.symbol,
+          market: data.market,
+          side: data.side,
+          entry: data.entry,
+          tp: data.tp,
+          sl: data.sl,
+          timeframe: data.timeframe,
+          result,
+          chartUrl,
+        })
+
+        await sendToDiscord(closeWebhook, {
+          username: "Quantio Signal Bot",
+          embeds: embedPayload.embeds,
+        })
+
+        console.log("[DISCORD] CLOSE signal sent")
+      } catch (e) {
+        console.error("[DISCORD] CLOSE failed", e)
+      }
+    } else {
+      console.warn("[DISCORD] No CLOSE webhook configured")
+    }
+  }
+
+  return new Response(JSON.stringify({ success: true }), { status: 200 })
+})
